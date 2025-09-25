@@ -1,0 +1,114 @@
+name: Build Model with Loss 551
+description: Instantiates a model using create_model from the NeSy-Factory-Models GitHub repo, with optional weight updates, and saves both model and updated config. Supports special handling for MPQE models with graph loading.
+inputs:
+  - {name: data_path, type: Dataset, description: "Path to processed graph data (all_data.pkl from JSON_to_PKL_Converter)"}
+  - {name: config_str, type: String, description: "Model config as JSON string"}
+  - {name: model_name, type: String, description: "Name of the model to instantiate (e.g., mpqe, tgcn, ffnetwork)"}
+outputs:
+  - {name: model_out, type: Model, description: "Model weights (torch saved state_dict)"}
+  - {name: config_updated, type: String, description: "Updated config as JSON string"}
+implementation:
+  container:
+    image: adityamanjunath/my-nesy-factory:v1
+    command:
+      - sh
+      - -c
+      - |
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import torch
+        import argparse
+        import json
+        import os
+        from nesy_factory.GNNs import create_model
+        from nesy_factory.utils.data_utils import load_graph
+        from nesy_factory.utils import mpqeutils
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--data_path', type=str, required=True)
+        parser.add_argument('--config_str', type=str, required=True)
+        parser.add_argument('--model_name', type=str, required=True)
+        parser.add_argument('--model_out', type=str, required=True)
+        parser.add_argument('--config_updated', type=str, required=True)
+        args = parser.parse_args()
+
+        print(f"Received data_path: {args.data_path}")
+        print(f"Received config_str: {args.config_str}")
+        print(f"Received model_name: {args.model_name}")
+
+        config = json.loads(args.config_str)
+
+        # Update config to use the processed data directory
+        config['data_dir'] = args.data_path
+        config['model_name'] = args.model_name
+
+        print(f"Updated config data_dir to: {config['data_dir']}")
+
+        # Create model with loss configuration built-in
+        model = create_model(args.model_name, config)
+
+        # Special handling for RGCN models
+        if args.model_name.lower() in ['mpqe']:
+            # Load graph and encoder for RGCN
+            graph, feature_modules, node_maps = load_graph(
+                config['data_dir'], 
+                config['embed_dim']
+            )
+            
+            if config.get('use_cuda', False):
+                graph.features = mpqeutils.cudify(feature_modules, node_maps)
+                for key in node_maps:
+                    node_maps[key] = node_maps[key].cuda()
+            
+            out_dims = {mode: config['embed_dim'] for mode in graph.relations}
+            enc = mpqeutils.get_encoder(
+                config.get('depth', 0), 
+                graph, 
+                out_dims, 
+                feature_modules, 
+                config.get('use_cuda', False)
+            )
+            
+            # Set graph and encoder
+            model.set_graph_and_encoder(graph, enc)
+            
+            # Print loss configuration info
+            print(f"Model configured with loss function: {model.loss_function_name}")
+            if hasattr(model, 'margin'):
+                print(f"Margin parameter: {model.margin}")
+
+        print("Model created successfully.")
+        print(model)
+
+        # Create proper output paths with filenames (matching YAML pattern)
+        model_output_path = os.path.join(args.model_out, 'base_model.pt')
+        config_output_path = os.path.join(args.config_updated, 'config_updated.json')
+
+        # Ensure output dirs
+        os.makedirs(args.model_out, exist_ok=True)
+        os.makedirs(args.config_updated, exist_ok=True)
+
+        # Save model state_dict
+        torch.save(model.state_dict(), model_output_path)
+
+        # Save updated config
+        with open(config_output_path, 'w') as f:
+            json.dump(config, f, indent=2)
+
+        print(f"Model saved to {model_output_path}")
+        print(f"Updated config saved to {config_output_path}")
+        print(f"Final config: {config}")
+    args:
+      - --model_name
+      - {inputValue: model_name}
+      - --config_str
+      - {inputValue: config_str}
+      - --data_path
+      - {inputPath: data_path}
+      - --model_out
+      - {outputPath: model_out}
+      - --config_updated
+      - {outputPath: config_updated}

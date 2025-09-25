@@ -1,0 +1,381 @@
+name: JSON_to_PKL_Converter MK 50
+description: Downloads JSON graph data from CDN URL and converts to pickle format with train/validation/test splits for graph queries.
+inputs:
+  - {name: json_url, type: String, description: "CDN URL of the JSON file containing graph data"}
+outputs:
+  - {name: processed_data, type: Dataset, description: "Processed graph data in pickle format with train/val/test splits"}
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import json
+        import pickle
+        import random
+        import os
+        import argparse
+        import requests
+        from itertools import combinations
+        from collections import defaultdict
+
+        def download_json_from_url(url):
+            print(f"Fetching JSON from CDN: {url}")
+            resp = requests.get(url)
+            resp.raise_for_status()
+            json_data = resp.json()
+            print(f"Successfully downloaded and parsed JSON data")
+            return json_data
+
+        def convert_json_to_tuples(json_data):
+            result = []
+            for item in json_data:
+                start_node = item.get('n', {})
+                relationship = item.get('r', {})
+                end_node = item.get('m', {})
+                
+                start_id = start_node.get('identity', 0)
+                start_labels = start_node.get('labels', [])
+                start_label = start_labels[0].lower() if start_labels else 'unknown'
+                
+                rel_type = relationship.get('type', '')
+                rel_id = relationship.get('identity', 0)
+                
+                end_id = end_node.get('identity', 0)
+                end_labels = end_node.get('labels', [])
+                end_label = end_labels[0].lower() if end_labels else 'unknown'
+                
+                if ('_' in str(start_label) or '_' in str(end_label) or '_' in str(rel_type)):
+                    continue
+                
+                tuple_item = (('1-chain', (rel_id, (start_label, rel_type, end_label), end_id)), None, None)
+                result.append(tuple_item)
+            return result
+
+        def split_data(data, train_ratio=0.6, val_ratio=0.20, test_ratio=0.20):
+            random.shuffle(data)
+            n = len(data)
+            train_end = int(n * train_ratio)
+            val_end = int(n * (train_ratio + val_ratio))
+            train_data = data[:train_end]
+            val_data = data[train_end:val_end]
+            test_data = data[val_end:]
+            return train_data, val_data, test_data
+
+        def build_entity_pools(tuples):
+            entity_pools = defaultdict(set)
+            for tuple_item in tuples:
+                rel_id = tuple_item[0][1][0]
+                start_label = tuple_item[0][1][1][0]
+                end_label = tuple_item[0][1][1][2]
+                end_id = tuple_item[0][1][2]
+                entity_pools[start_label].add(rel_id)
+                entity_pools[end_label].add(end_id)
+            return {entity_type: list(entities) for entity_type, entities in entity_pools.items()}
+
+        def generate_negative_samples(positive_tuple, entity_pools, num_negatives=1):
+            rel_id = positive_tuple[0][1][0]
+            start_label = positive_tuple[0][1][1][0]
+            rel_type = positive_tuple[0][1][1][1]
+            end_label = positive_tuple[0][1][1][2]
+            end_id = positive_tuple[0][1][2]
+            negatives = []
+            if end_label in entity_pools:
+                target_entities = entity_pools[end_label]
+                available_negatives = [e for e in target_entities if e != end_id]
+                if available_negatives:
+                    sample_size = min(num_negatives, len(available_negatives))
+                    negatives = random.sample(available_negatives, sample_size)
+            return negatives
+
+        def add_negatives_to_tuples(tuples, entity_pools, num_negatives=1):
+            updated_tuples = []
+            for tuple_item in tuples:
+                negatives = generate_negative_samples(tuple_item, entity_pools, num_negatives)
+                updated_tuple = (tuple_item[0], negatives if negatives else [], None)
+                updated_tuples.append(updated_tuple)
+            return updated_tuples
+
+        def convert_to_query_format(tuples):
+            query_format_tuples = []
+            for tuple_item in tuples:
+                if tuple_item[0][0] == '1-chain':
+                    query_graph = (tuple_item[0][0], tuple_item[0][1])
+                else:
+                    query_graph = tuple_item[:-2]
+                neg_samples = tuple_item[-2] if tuple_item[-2] else []
+                hard_neg_samples = neg_samples
+                serialized_query = (query_graph, neg_samples, hard_neg_samples)
+                query_format_tuples.append(serialized_query)
+            return query_format_tuples
+
+        def convert_complex_queries_to_query_format(query_tuples):
+            query_format_tuples = []
+            for query_tuple in query_tuples:
+                query_type = query_tuple[0]
+                if query_type in ['2-chain', '2-inter']:
+                    query_graph = (query_type, query_tuple[1], query_tuple[2])
+                    neg_samples = query_tuple[3] if query_tuple[3] else []
+                elif query_type in ['3-chain', '3-inter']:
+                    query_graph = (query_type, query_tuple[1], query_tuple[2], query_tuple[3])
+                    neg_samples = query_tuple[4] if query_tuple[4] else []
+                else:
+                    query_graph = query_tuple[:-2]
+                    neg_samples = query_tuple[-2] if query_tuple[-2] else []
+                hard_neg_samples = neg_samples
+                serialized_query = (query_graph, neg_samples, hard_neg_samples)
+                query_format_tuples.append(serialized_query)
+            return query_format_tuples
+
+        def add_negatives_to_complex_queries(query_tuples, entity_pools, num_negatives=1):
+            updated_queries = []
+            for query_tuple in query_tuples:
+                query_type = query_tuple[0]
+                if query_type == '2-chain':
+                    target_id = query_tuple[2][2]
+                    target_type = query_tuple[2][1][2]
+                elif query_type == '2-inter':
+                    target_id = query_tuple[1][2]
+                    target_type = query_tuple[1][1][2]
+                elif query_type == '3-chain':
+                    target_id = query_tuple[3][2]
+                    target_type = query_tuple[3][1][2]
+                elif query_type == '3-inter':
+                    target_id = query_tuple[1][2]
+                    target_type = query_tuple[1][1][2]
+                else:
+                    target_id = None
+                    target_type = 'resource'
+                
+                negatives = []
+                if target_type in entity_pools and target_id is not None:
+                    available_negatives = [e for e in entity_pools[target_type] if e != target_id]
+                    if available_negatives:
+                        sample_size = min(num_negatives, len(available_negatives))
+                        negatives = random.sample(available_negatives, sample_size)
+                
+                if query_type in ['2-chain', '2-inter']:
+                    updated_query = (query_tuple[0], query_tuple[1], query_tuple[2], negatives, None)
+                elif query_type in ['3-chain', '3-inter']:
+                    updated_query = (query_tuple[0], query_tuple[1], query_tuple[2], query_tuple[3], negatives, None)
+                else:
+                    updated_query = query_tuple[:-1] + (negatives, None)
+                updated_queries.append(updated_query)
+            return updated_queries
+
+        def create_graph_data_structure(tuples):
+            relations = defaultdict(list)
+            triples = defaultdict(lambda: defaultdict(set))
+            entity_type_mapping = defaultdict(set)
+            
+            for tuple_item in tuples:
+                rel_id = tuple_item[0][1][0]
+                start_label = tuple_item[0][1][1][0]
+                rel_type = tuple_item[0][1][1][1]
+                end_label = tuple_item[0][1][1][2]
+                end_id = tuple_item[0][1][2]
+                
+                if (end_label, rel_type) not in relations[start_label]:
+                    relations[start_label].append((end_label, rel_type))
+                if (start_label, rel_type) not in relations[end_label]:
+                    relations[end_label].append((start_label, rel_type))
+                
+                triple_key = (start_label, rel_type, end_label)
+                triples[triple_key][rel_id].add(end_id)
+                
+                entity_type_mapping[start_label].add(rel_id)
+                entity_type_mapping[end_label].add(end_id)
+            
+            relations_dict = dict(relations)
+            triples_dict = {}
+            for key, value in triples.items():
+                triples_dict[key] = dict(value)
+            entity_type_dict = {}
+            for entity_type, entity_ids in entity_type_mapping.items():
+                entity_type_dict[entity_type] = sorted(list(entity_ids))
+            return relations_dict, triples_dict, entity_type_dict
+
+        def create_two_chain(tuples):
+            two_chain = []
+            for i, j in enumerate(tuples):
+                source_id = j[0][1][0]
+                target_id = j[0][1][2]
+                for m in tuples[i + 1:]:
+                    source = m[0][1][0]
+                    target = m[0][1][2]
+                    if target_id == source and source_id != target:
+                        j_labels_and_rel = [j[0][1][1][0], j[0][1][1][1], j[0][1][1][2]]
+                        m_labels_and_rel = [m[0][1][1][0], m[0][1][1][1], m[0][1][1][2]]
+                        if any('_' in str(item) for item in j_labels_and_rel + m_labels_and_rel):
+                            continue
+                        two_chain_tuple = (('2-chain', j[0][1], m[0][1], None, None))
+                        two_chain.append(two_chain_tuple)
+            return two_chain
+
+        def create_two_inter(tuples):
+            two_inter = []
+            for i, j in enumerate(tuples):
+                source_id = j[0][1][0]
+                target_id = j[0][1][2]
+                for m in tuples[i + 1:]:
+                    source = m[0][1][0]
+                    target = m[0][1][2]
+                    if source_id == source and target_id != target:
+                        j_labels_and_rel = [j[0][1][1][0], j[0][1][1][1], j[0][1][1][2]]
+                        m_labels_and_rel = [m[0][1][1][0], m[0][1][1][1], m[0][1][1][2]]
+                        if any('_' in str(item) for item in j_labels_and_rel + m_labels_and_rel):
+                            continue
+                        two_inter_tuple = (('2-inter', j[0][1], m[0][1], None, None))
+                        two_inter.append(two_inter_tuple)
+            return two_inter
+
+        def create_three_chain(tuples):
+            three_chain = []
+            two_chains = []
+            for i, j in enumerate(tuples):
+                source_id = j[0][1][0]
+                target_id = j[0][1][2]
+                for m in tuples[i + 1:]:
+                    source = m[0][1][0]
+                    target = m[0][1][2]
+                    if target_id == source and source_id != target:
+                        j_labels_and_rel = [j[0][1][1][0], j[0][1][1][1], j[0][1][1][2]]
+                        m_labels_and_rel = [m[0][1][1][0], m[0][1][1][1], m[0][1][1][2]]
+                        if not any('_' in str(item) for item in j_labels_and_rel + m_labels_and_rel):
+                            two_chains.append((j[0][1], m[0][1]))
+            
+            for two_chain in two_chains:
+                chain_end = two_chain[1][2]
+                for tuple_item in tuples:
+                    third_start = tuple_item[0][1][0]
+                    third_end = tuple_item[0][1][2]
+                    if chain_end == third_start and chain_end != third_end:
+                        third_labels_and_rel = [tuple_item[0][1][1][0], tuple_item[0][1][1][1], tuple_item[0][1][1][2]]
+                        if not any('_' in str(item) for item in third_labels_and_rel):
+                            if third_end not in [two_chain[0][0], two_chain[1][0]]:
+                                three_chain_tuple = (('3-chain', two_chain[0], two_chain[1], tuple_item[0][1], None))
+                                three_chain.append(three_chain_tuple)
+            return three_chain
+
+        def create_three_inter(tuples):
+            three_inter = []
+            source_groups = {}
+            for tuple_item in tuples:
+                source_id = tuple_item[0][1][0]
+                labels_and_rel = [tuple_item[0][1][1][0], tuple_item[0][1][1][1], tuple_item[0][1][1][2]]
+                if any('_' in str(item) for item in labels_and_rel):
+                    continue
+                if source_id not in source_groups:
+                    source_groups[source_id] = []
+                source_groups[source_id].append(tuple_item[0][1])
+            
+            for source_id, relationships in source_groups.items():
+                if len(relationships) >= 3:
+                    for combo in combinations(relationships, 3):
+                        targets = [rel[2] for rel in combo]
+                        if len(set(targets)) == 3:
+                            three_inter_tuple = (('3-inter', combo[0], combo[1], combo[2], None))
+                            three_inter.append(three_inter_tuple)
+            return three_inter
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--json_url', type=str, required=True)
+        parser.add_argument('--processed_data', type=str, required=True)
+        args = parser.parse_args()
+
+        random.seed(42)
+
+        try:
+            json_data = download_json_from_url(args.json_url)
+            tuples = convert_json_to_tuples(json_data)
+            
+            if not tuples:
+                print("No valid tuples found. Exiting.")
+                exit(1)
+            
+            print(f"Processed {len(tuples)} tuples from JSON data")
+            
+            entity_pools = build_entity_pools(tuples)
+            tuples_with_negatives = add_negatives_to_tuples(tuples, entity_pools, num_negatives=1)
+            
+            two_chain_tuples = create_two_chain(tuples_with_negatives)
+            two_inter_tuples = create_two_inter(tuples_with_negatives)
+            three_chain_tuples = create_three_chain(tuples_with_negatives)
+            three_inter_tuples = create_three_inter(tuples_with_negatives)
+            
+            print(f"Generated complex queries: 2-chain({len(two_chain_tuples)}), 2-inter({len(two_inter_tuples)}), 3-chain({len(three_chain_tuples)}), 3-inter({len(three_inter_tuples)})")
+            
+            two_chain_with_negs = add_negatives_to_complex_queries(two_chain_tuples, entity_pools, num_negatives=1)
+            two_inter_with_negs = add_negatives_to_complex_queries(two_inter_tuples, entity_pools, num_negatives=1)
+            three_chain_with_negs = add_negatives_to_complex_queries(three_chain_tuples, entity_pools, num_negatives=1)
+            three_inter_with_negs = add_negatives_to_complex_queries(three_inter_tuples, entity_pools, num_negatives=1)
+            
+            relations, triples, entity_types = create_graph_data_structure(tuples)
+            graph_data = [relations, triples, entity_types]
+            
+            edges_serialized = convert_to_query_format(tuples_with_negatives)
+            train_edges, val_edges, test_edges = split_data(edges_serialized)
+            
+            two_chain_serialized = convert_complex_queries_to_query_format(two_chain_with_negs)
+            two_inter_serialized = convert_complex_queries_to_query_format(two_inter_with_negs)
+            three_chain_serialized = convert_complex_queries_to_query_format(three_chain_with_negs)
+            three_inter_serialized = convert_complex_queries_to_query_format(three_inter_with_negs)
+            
+            all_2hop_queries = two_chain_serialized + two_inter_serialized
+            all_3hop_queries = three_chain_serialized + three_inter_serialized
+            
+            train_queries_2, val_queries_2, test_queries_2 = split_data(all_2hop_queries)
+            train_queries_3, val_queries_3, test_queries_3 = split_data(all_3hop_queries)
+            
+            all_data = {
+                'graph': graph_data,
+                'train_edges': train_edges,
+                'val_edges': val_edges,
+                'test_edges': test_edges,
+                'train_queries_2': train_queries_2,
+                'val_queries_2': val_queries_2,
+                'test_queries_2': test_queries_2,
+                'train_queries_3': train_queries_3,
+                'val_queries_3': val_queries_3,
+                'test_queries_3': test_queries_3
+            }
+            
+            # Create the proper output path with .pkl extension
+            if args.processed_data.endswith('.pkl'):
+                output_path = args.processed_data
+            else:
+                # If processed_data is a directory path, create all_data.pkl inside it
+                output_path = os.path.join(args.processed_data, 'all_data.pkl')
+            
+            # Ensure the directory exists
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            with open(output_path, 'wb') as f:
+                pickle.dump(all_data, f)
+            
+            print(f"Successfully saved processed data to: {output_path}")
+            print(f"Data contains:")
+            print(f"  - Train edges: {len(train_edges)}")
+            print(f"  - Val edges: {len(val_edges)}")
+            print(f"  - Test edges: {len(test_edges)}")
+            print(f"  - 2-hop queries (train/val/test): {len(train_queries_2)}/{len(val_queries_2)}/{len(test_queries_2)}")
+            print(f"  - 3-hop queries (train/val/test): {len(train_queries_3)}/{len(val_queries_3)}/{len(test_queries_3)}")
+            
+        except Exception as e:
+            print(f"Error processing data: {e}")
+            exit(1)
+    args:
+      - --json_url
+      - {inputValue: json_url}
+      - --processed_data
+      - {outputPath: processed_data}

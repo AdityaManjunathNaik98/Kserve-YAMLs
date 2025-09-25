@@ -1,0 +1,58 @@
+name: Upload to MinIO
+description: Upload to a fixed MinIO bucket with application name and directory
+inputs:
+- {name: Data}  # Input file path or directory
+- {name: MinIO bucket name, type: String}  # MinIO bucket name
+- {name: Application name, type: String}  # Application name to include in the path
+outputs:
+- {name: MinIO path, type: String}  # Output MinIO path
+metadata:
+  annotations:
+    author: Nikhil <nikhil.v@mobiusdtaas.ai>
+implementation:
+    container:
+        image: ubuntu:22.04  # Using Ubuntu 22.04
+        command:
+        - sh
+        - -ex
+        - -c
+        - |
+            # Update the package list using IPv4
+            apt-get -o Acquire::ForceIPv4=true update
+
+            # Install wget using IPv4
+            apt-get -o Acquire::ForceIPv4=true install -y wget
+
+            # Download the MinIO client (mc)
+            wget https://dl.min.io/client/mc/release/linux-amd64/mc
+
+            # Make mc executable
+            chmod +x mc
+
+            # Move mc to /usr/local/bin so it's available in the PATH
+            mv mc /usr/local/bin/
+
+            # Set up MinIO alias with your local MinIO instance
+            mc alias set myminio http://minio-service.kubeflow.svc.cluster.local:9000 minio K7712XV0U4HRXJOCL8JJFPBVUNFNZL
+
+            # Check if the bucket exists, if not create it
+            if ! mc ls myminio/"$1"; then
+              mc mb myminio/"$1"
+            fi
+
+            # Copy the contents of the Data directory to /<application name>/
+            if [ -d "$0" ]; then
+              mc cp --recursive "$0/" "myminio/$1/$2/1/"
+            else
+              echo "The specified input path does not exist or is not a directory."
+            fi
+
+            # Create the output directory locally if needed
+            mkdir -p "$(dirname "$3")"
+
+            # Save the s3-style MinIO path to the output in the format s3://bucket/application/
+            echo "s3://$1/$2/" > "$3"
+        - inputPath: Data
+        - inputValue: MinIO bucket name
+        - inputValue: Application name
+        - outputPath: MinIO path
